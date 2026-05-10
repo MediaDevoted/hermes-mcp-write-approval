@@ -1,0 +1,8 @@
+name: mcp-write-approval
+version: "0.1.0"
+description: >
+  Per-call user approval for MCP write/destructive tools. Hermes' built-in
+  approval flow only gates dangerous shell commands; this plugin extends the
+  same UX to MCP tool calls. Reads each MCP's manifest to discover which
+  tools are mode=write or mode=destructive, blocks them via pre_tool_call,
+  and unblocks on `/allow`, `/allow-session`, or `/allow-always`.
