@@ -251,16 +251,37 @@ def _send_prompt_to_user(session_id: str, tool_name: str, args: Dict[str, Any]) 
 
     # Gateway path: piggy-back on Hermes' approval notify callback, which
     # the gateway adapter (Slack/Telegram/Discord) registers per session.
+    #
+    # IMPORTANT: the gateway registers under its `session_key` (a stable
+    # per-channel identity like `agent:main:telegram:dm:6157749755`), NOT
+    # the per-conversation `session_id` (like `20260512_212803_b4e0bbfe`)
+    # that this hook receives as a kwarg. They are different identifiers.
+    # The contextvar `_approval_session_key` in tools.approval is set by
+    # the gateway runner around `agent.run_conversation(...)` to bridge
+    # the two — we read it via `get_current_session_key`. Without this,
+    # the lookup miss falls through to the CLI `print(msg)` path which is
+    # invisible on Telegram/Slack and the call times out at 300s with the
+    # user never seeing a prompt.
     try:
         from tools.approval import _gateway_notify_cbs, _lock as _approval_lock  # type: ignore
+        try:
+            from tools.approval import get_current_session_key  # type: ignore
+            session_key = get_current_session_key(default=session_id)
+        except Exception:
+            session_key = session_id
     except Exception:
         _gateway_notify_cbs = {}
         _approval_lock = None
+        session_key = session_id
 
     notify_cb = None
     if _approval_lock is not None:
         with _approval_lock:
-            notify_cb = _gateway_notify_cbs.get(session_id)
+            notify_cb = _gateway_notify_cbs.get(session_key)
+            # Fallback for older Hermes builds that registered under the
+            # task_id (= session_id). Try that next if session_key missed.
+            if notify_cb is None and session_key != session_id:
+                notify_cb = _gateway_notify_cbs.get(session_id)
 
     if notify_cb is not None:
         try:
