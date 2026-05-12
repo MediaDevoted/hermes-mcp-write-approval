@@ -244,9 +244,9 @@ def _send_prompt_to_user(session_id: str, tool_name: str, args: Dict[str, Any]) 
         f"✋ This MCP call needs approval.\n"
         f"Tool: `{tool_name}` ({mode})\n"
         f"Args: `{_format_args(args)}`\n"
-        f"Reply `/allow` to run once, `/allow-session` to allow this tool "
-        f"for the rest of the session, `/allow-always` to remember it, "
-        f"or `/deny-mcp` to cancel."
+        f"Reply `/approve` to run once, `/approve session` to allow this tool "
+        f"for the rest of the session, `/approve always` to remember it, "
+        f"or `/deny` to cancel."
     )
 
     # Gateway path: piggy-back on Hermes' approval notify callback, which
@@ -302,21 +302,76 @@ def _send_prompt_to_user(session_id: str, tool_name: str, args: Dict[str, Any]) 
 
 
 def _queue_and_wait(session_id: str, tool_name: str, args: Dict[str, Any]) -> str:
-    """Park the call on this session's queue, prompt the user, block.
+    """Park the call on Hermes' shared gateway queue, prompt the user, block.
 
     Returns one of: "once", "session", "always", "deny", "timeout".
+
+    Why Hermes' shared queue, not the plugin's local one: the gateway
+    routes `/approve` and `/deny` through `tools.approval.resolve_gateway_approval`,
+    which pops from `_gateway_queues[session_key]`. If we keep a separate
+    queue locally, the gateway can't see our pending entries and the
+    user's `/approve` never reaches us. So we hook into the same dict
+    the gateway resolves against — exactly the path Hermes' built-in
+    dangerous-command flow uses.
     """
-    entry = _PendingEntry(tool_name, args)
-    with _lock:
-        _pending.setdefault(session_id, []).append(entry)
+    # Resolve the gateway session_key the runner registered the notify
+    # callback under (per-channel like "agent:main:telegram:dm:..."),
+    # not the per-conversation session_id we received as a hook kwarg.
+    try:
+        from tools.approval import get_current_session_key  # type: ignore
+        session_key = get_current_session_key(default=session_id)
+    except Exception:
+        session_key = session_id
+
+    # Use Hermes' _ApprovalEntry + _gateway_queues so /approve resolves us.
+    # Fall back to the plugin-local _PendingEntry + _pending dict if
+    # tools.approval isn't importable (CLI-only edge case).
+    use_shared = False
+    try:
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            _lock as _approval_lock,
+        )  # type: ignore
+        approval_data = {
+            "command": f"mcp:{tool_name}",
+            "description": (
+                f"✋ This MCP call needs approval.\n"
+                f"Tool: `{tool_name}` ({_mode_for(tool_name)})\n"
+                f"Args: `{_format_args(args)}`\n"
+                f"Reply `/approve` to run once, `/approve session` to allow this tool "
+                f"for the rest of the session, `/approve always` to remember it, "
+                f"or `/deny` to cancel."
+            ),
+            "pattern_key": f"mcp:{tool_name}",
+            "pattern_keys": [f"mcp:{tool_name}"],
+        }
+        entry = _ApprovalEntry(approval_data)
+        with _approval_lock:
+            _gateway_queues.setdefault(session_key, []).append(entry)
+        use_shared = True
+    except Exception as exc:
+        logger.warning("Falling back to plugin-local queue (no tools.approval): %s", exc)
+        entry = _PendingEntry(tool_name, args)
+        with _lock:
+            _pending.setdefault(session_id, []).append(entry)
+        _approval_lock = None
 
     if not _send_prompt_to_user(session_id, tool_name, args):
-        with _lock:
-            queue = _pending.get(session_id, [])
-            if entry in queue:
-                queue.remove(entry)
-            if not queue:
-                _pending.pop(session_id, None)
+        if use_shared:
+            with _approval_lock:
+                queue = _gateway_queues.get(session_key, [])
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+        else:
+            with _lock:
+                queue = _pending.get(session_id, [])
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    _pending.pop(session_id, None)
         return "deny"
 
     timeout_s = _DEFAULT_TIMEOUT_SECS
@@ -347,12 +402,21 @@ def _queue_and_wait(session_id: str, tool_name: str, args: Dict[str, Any]) -> st
             except Exception:
                 pass
 
-    with _lock:
-        queue = _pending.get(session_id, [])
-        if entry in queue:
-            queue.remove(entry)
-        if not queue:
-            _pending.pop(session_id, None)
+    # Drain entry from whichever queue it lives in
+    if use_shared:
+        with _approval_lock:
+            queue = _gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+    else:
+        with _lock:
+            queue = _pending.get(session_id, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _pending.pop(session_id, None)
 
     if not resolved:
         return "timeout"
