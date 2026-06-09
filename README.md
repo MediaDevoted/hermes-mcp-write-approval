@@ -1,8 +1,8 @@
 # mcp-write-approval
 
-A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that asks for user approval before any MCP write or destructive tool fires.
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that intercepts MCP tool calls and asks for user approval before any write or destructive tool fires.
 
-Hermes' built-in approval flow gates dangerous *shell* commands. MCP tool calls auto-execute. This plugin extends the same UX to MCP tools — read calls still pass through silently, but `cloudflare_delete_dns_record`, `voluum_archive_campaign`, `dropbox_delete_file`, etc. block until the user says yes.
+Hermes' built-in approval flow gates dangerous *shell* commands. MCP tool calls auto-execute by default. This plugin extends the same UX to MCP tools — read calls still pass through silently, but tools like `cloudflare_delete_dns_record`, `voluum_archive_campaign`, or `dropbox_delete_file` block until the user says yes.
 
 ## What it does
 
@@ -26,6 +26,41 @@ of the session, /allow-always to remember it, or /deny-mcp to cancel.
 
 The CLI surface only registers `/allow*` / `/deny-mcp` (Hermes' built-in `/approve` and `/deny` belong to the shell-command flow). Reads always pass through.
 
+## Key features
+
+- **Zero core changes** — plugs into Hermes' public `pre_tool_call` hook and slash-command interfaces only.
+- **Gateway-aware** — reuses Hermes' existing notify callback so approval prompts are delivered via whichever gateway is active (Slack, Telegram, Discord, dashboard chat, or stdout for CLI).
+- **Three approval tiers** — once, session-scoped, or persistent (written atomically to disk via tmp-file rename so a crash can't corrupt state).
+- **Catalog-driven or heuristic** — modes come from each MCP's `/tools-manifest` endpoint when configured; falls back to a name-suffix heuristic out of the box.
+- **FIFO queue** — multiple blocked calls are resolved in order; each `/allow` advances the queue by one.
+- **Heartbeat-safe blocking** — the wait loop polls in 1-second slices so the gateway inactivity watchdog keeps ticking.
+- **~360 lines, single file** — no dependencies beyond the Python standard library and Hermes itself.
+
+## Architecture
+
+```
+Hermes agent loop
+  └─ invoke_hook("pre_tool_call")
+       └─ _on_pre_tool_call()          ← this plugin
+            ├─ _requires_approval()    classify tool (catalog or heuristic)
+            ├─ _is_approved()          check session / persistent allowlist
+            └─ _queue_and_wait()       park call, notify user, block
+                  ├─ hooks into tools.approval._gateway_queues  (shared path)
+                  └─ falls back to plugin-local _pending dict   (CLI-only)
+
+User types /allow (or /allow-session, /allow-always, /deny-mcp)
+  └─ slash handler resolves oldest pending entry
+       └─ entry.event.set() → hook returns None (allow) or block dict (deny)
+```
+
+Persistent state lives at `~/.hermes/state/mcp_approvals.json`:
+
+```json
+{
+  "always_allow": ["cloudflare_purge_cache", "voluum_archive_campaign"]
+}
+```
+
 ## Install
 
 ```bash
@@ -35,55 +70,112 @@ git clone https://github.com/MediaDevoted/hermes-mcp-write-approval \
 hermes plugins enable mcp-write-approval
 ```
 
-Then restart Hermes (or fire `/reload-mcp` if you only changed config).
+Then restart Hermes (or fire `/reload-plugins` if your build supports hot reload).
 
 ## Configure
 
 The plugin discovers which tools need approval in one of three ways, in order of precision:
 
-1. **Set `HERMES_MCP_APPROVAL_MANIFESTS`** to a comma-separated list of MCP `/tools-manifest` URLs:
+### 1. Per-server manifests (recommended)
 
-   ```bash
-   export HERMES_MCP_APPROVAL_MANIFESTS="\
-   https://cloudflare-mcp-prod.mediadevoted.com/tools-manifest,\
-   https://voluum-mcp-prod.mediadevoted.com/tools-manifest,\
-   https://domain-bank-mcp-prod.mediadevoted.com/tools-manifest"
-   ```
+Set `HERMES_MCP_APPROVAL_MANIFESTS` to a comma-separated list of MCP `/tools-manifest` URLs:
 
-   At startup the plugin fetches each one and reads `tools[].mode` (`read` / `write` / `destructive`). Anything `write` or `destructive` triggers the prompt.
+```bash
+export HERMES_MCP_APPROVAL_MANIFESTS="\
+https://cloudflare-mcp-prod.mediadevoted.com/tools-manifest,\
+https://voluum-mcp-prod.mediadevoted.com/tools-manifest,\
+https://domain-bank-mcp-prod.mediadevoted.com/tools-manifest"
+```
 
-2. **Set `HERMES_MCP_APPROVAL_CATALOG`** to one URL that returns a flat list:
+At startup the plugin fetches each URL and reads `tools[].mode` (`read` / `write` / `destructive`). Anything `write` or `destructive` triggers the approval prompt.
 
-   ```json
-   [{"name":"cloudflare_delete_dns_record","mode":"destructive"},
-    {"name":"voluum_create_campaign","mode":"write"}]
-   ```
+### 2. Flat catalog
 
-3. **Set neither**, and the plugin falls back to a name-suffix heuristic: any tool whose name ends in `_write`, `_create`, `_update`, `_delete`, `_destroy`, `_remove`, `_archive`, `_pause`, `_purge`, `_stop`, `_restart`, `_enable`, `_disable`, `_rename`, `_reset`, `_upsert`, `_set` triggers the prompt. Coarser than option 1 (won't distinguish `write` from `destructive`), but works out of the box.
+Set `HERMES_MCP_APPROVAL_CATALOG` to one URL that returns a flat list:
 
-Optional auth: set `HERMES_MCP_APPROVAL_AUTH` to a bearer token if your manifests live behind authentication.
+```json
+[{"name":"cloudflare_delete_dns_record","mode":"destructive"},
+ {"name":"voluum_create_campaign","mode":"write"}]
+```
 
-Optional timeout: `HERMES_MCP_APPROVAL_TIMEOUT` (seconds, default 300). After this, the call is denied with a `BLOCKED: approval ... timed out` message.
+### 3. Name-suffix heuristic (default fallback)
+
+Set neither env var, and the plugin falls back to checking tool name suffixes. Any tool whose name ends in `_write`, `_create`, `_update`, `_delete`, `_destroy`, `_remove`, `_archive`, `_pause`, `_purge`, `_stop`, `_restart`, `_enable`, `_disable`, `_rename`, `_reset`, `_upsert`, or `_set` triggers the prompt. Coarser than option 1 (flags everything as `write`, never `destructive`), but works out of the box with no configuration.
+
+### Additional env vars
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HERMES_MCP_APPROVAL_MANIFESTS` | — | Comma-separated list of `/tools-manifest` URLs |
+| `HERMES_MCP_APPROVAL_CATALOG` | — | Single URL returning a flat tool list |
+| `HERMES_MCP_APPROVAL_AUTH` | — | Bearer token for authenticated manifest endpoints |
+| `HERMES_MCP_APPROVAL_TIMEOUT` | `1200` | Seconds before an unanswered prompt is auto-denied (20min, was 5min) |
+| `HERMES_MCP_APPROVAL_TIMEOUT_<TOOL>` | — | Per-tool timeout override. `<TOOL>` is the tool name upcased with `:`/`-` → `_`. e.g. `HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER=600` |
+| `HERMES_APPROVAL_MENTION_USER` | — | Slack user id (e.g. `U01CVNZK5U7`) to `<@>`-mention at the start of every approval prompt and reminder. Forces a push notification on mobile even when the message is a threaded DM reply |
+
+See `.env.template` for a copy-paste starting point.
+
+### Push notification reliability (Slack)
+
+Slack does **not** push-notify threaded DM replies by default. The original
+approval Block Kit posted by the gateway lives inside a thread the user
+isn't actively watching, so on mobile it stays silent. To make sure the
+user actually sees the prompt:
+
+1. **Set `HERMES_APPROVAL_MENTION_USER`** to their Slack user id. The
+   plugin prepends `<@USERID>` to every approval message and reminder,
+   which turns the message into a directed-mention event that Slack
+   pushes regardless of thread state.
+2. **Progressive reminders.** The plugin re-pings the gateway at the
+   60-second and 5-minute marks while an approval is still pending, so
+   even if the first push is missed there are two more chances before
+   the 20-minute timeout fires.
 
 ## How it works
 
 The plugin registers a `pre_tool_call` hook. Hermes calls this for every tool the model invokes. When a write/destructive tool fires and is not yet approved:
 
-1. A `_PendingEntry` (containing a `threading.Event`) is pushed to the per-session queue.
-2. The plugin calls Hermes' existing gateway notify callback (the same one the built-in dangerous-command approval uses) so the prompt is delivered via whichever gateway adapter is active — Slack, Telegram, Discord, dashboard chat, etc. If no gateway is registered (pure CLI), the prompt prints to stdout.
+1. A `_PendingEntry` (containing a `threading.Event`) is pushed onto Hermes' shared `_gateway_queues[session_key]` so that the gateway's `/approve` resolver can reach it. A plugin-local fallback queue is used in CLI-only mode where `tools.approval` isn't importable.
+2. The plugin calls Hermes' existing gateway notify callback (the same one the built-in dangerous-command approval uses) so the prompt is delivered via whichever gateway adapter is active. If no gateway is registered, the prompt prints to stdout.
 3. The hook's worker thread blocks on `entry.event.wait(timeout)` with a 1-second poll slice so Hermes' activity heartbeat keeps ticking and the gateway inactivity watchdog doesn't kill the agent mid-prompt.
-4. When the user types `/allow` / `/allow-session` / `/allow-always` / `/deny-mcp`, the matching handler pops the oldest entry off the queue, sets `entry.result`, and fires the event. The hook returns `None` (allow) or `{"action": "block", "message": ...}` (deny / timeout) — exactly what `get_pre_tool_call_block_message()` is shaped to consume.
-5. `/allow-session` adds the tool name to `_session_approvals[session_id]`. `/allow-always` adds it to `_persistent_approvals` and writes the set to `~/.hermes/state/mcp_approvals.json` via a tmp-file rename so a crash mid-write can't corrupt it.
+4. When the user types `/allow` / `/allow-session` / `/allow-always` / `/deny-mcp`, the matching handler pops the oldest entry off the queue, sets `entry.result`, and fires the event. The hook returns `None` (allow) or `{"action": "block", "message": ...}` (deny / timeout).
+5. `/allow-session` adds the tool name to `_session_approvals[session_id]`. `/allow-always` adds it to `_persistent_approvals` and writes to `~/.hermes/state/mcp_approvals.json` via a tmp-file rename so a crash mid-write can't corrupt it.
 
-The plugin never reaches into MCP-side state, never modifies agent-platform, never extends Hermes core. It plugs into the public hook + slash-command interfaces. Roughly 360 lines, single file.
+**Session key vs. session ID:** Hermes uses two distinct identifiers. The gateway registers its notify callback under a stable per-channel `session_key` (e.g. `agent:main:telegram:dm:6157749755`), while the hook receives a per-conversation `session_id`. The plugin bridges these via `tools.approval.get_current_session_key` — without this, gateway prompts would never arrive and calls would silently time out.
 
-## Tests
+## Build / run
+
+This is a Hermes plugin (no standalone build step). A virtual environment with Hermes installed is required for the tests.
 
 ```bash
+# Create and activate a venv with Hermes
+python -m venv .venv
+source .venv/bin/activate
+pip install hermes-agent   # or however your org distributes Hermes
+
+# Run tests
 python -m pytest tests/test_plugin.py -v
 ```
 
-19 tests covering mode classification, approval state, persistence (round-trip + atomic write), pre_tool_call block / unblock for all four resolutions, FIFO ordering for queued calls, and the end-to-end path through Hermes' real `invoke_hook` + slash handler dispatch (no mocking).
+## Tests
+
+Tests cover:
+
+- Mode classification (catalog override, suffix heuristic, built-in tool pass-through)
+- Approval state isolation (session vs. persistent)
+- Persistence round-trip and atomic write
+- `pre_tool_call` block/unblock for all four resolutions (`once`, `session`, `always`, `deny`)
+- FIFO ordering for queued calls
+- End-to-end path through Hermes' real `invoke_hook` + slash handler dispatch (no mocking)
+- Timeout defaults + per-tool override env (`HERMES_MCP_APPROVAL_TIMEOUT_<TOOL>`)
+- Slack mention prefix appears in prompts and reminders when `HERMES_APPROVAL_MENTION_USER` is set, absent otherwise
+- Progressive reminders fire at the 60s and 300s elapsed marks while pending
+
+## Deployment
+
+Drop the plugin directory into `~/.hermes/plugins/` on any machine running Hermes. No containers or daemons required — the plugin runs in-process with the Hermes agent.
+
+For a fleet deployment, distribute the plugin via your internal package registry or a shared config layer, and set `HERMES_MCP_APPROVAL_MANIFESTS` in the agent's environment so every instance uses catalog-driven mode classification.
 
 ## License
 

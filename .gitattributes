@@ -1,0 +1,25 @@
+# Normalize line endings to LF on commit
+* text=auto eol=lf
+
+# Python source
+*.py text eol=lf diff=python
+
+# YAML / TOML / JSON — treat as text
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+
+# Markdown
+*.md text eol=lf diff=markdown
+
+# Shell scripts
+*.sh text eol=lf
+
+# Binary — do not mangle
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.gz  binary
+*.zip binary

@@ -71,7 +71,7 @@ _pending: Dict[str, List[_PendingEntry]] = {}
 # Bridge to gateway — populated by gateway_runner_for(session_id) below.
 # We store the registered notify_cb from tools.approval directly so we can
 # reuse Hermes' existing Slack/Telegram approval-message path.
-_DEFAULT_TIMEOUT_SECS = 300
+_DEFAULT_TIMEOUT_SECS = 1200
 
 # Fallback heuristic when no manifest catalog is available.
 _WRITE_SUFFIX_RE = re.compile(
@@ -233,6 +233,107 @@ def _format_args(args: Dict[str, Any], limit: int = 320) -> str:
     return s
 
 
+def _resolve_timeout(tool_name: str) -> int:
+    """Resolve the approval timeout for a given tool.
+
+    Order of precedence:
+      1. Per-tool override env var, e.g. for tool `voluum_create_offer`:
+         `HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER=600`
+      2. Global override: `HERMES_MCP_APPROVAL_TIMEOUT`
+      3. Module default (`_DEFAULT_TIMEOUT_SECS`, 1200s = 20min)
+
+    Per-tool overrides let ops trim noisy tools (e.g. fast write paths
+    used dozens of times per day) without lowering the global ceiling.
+    """
+    tool_env_key = (
+        "HERMES_MCP_APPROVAL_TIMEOUT_"
+        + tool_name.upper().replace(":", "_").replace("-", "_")
+    )
+    tool_override = os.environ.get(tool_env_key)
+    if tool_override:
+        try:
+            return max(1, int(tool_override))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(os.environ.get(
+            "HERMES_MCP_APPROVAL_TIMEOUT", _DEFAULT_TIMEOUT_SECS,
+        )))
+    except (TypeError, ValueError):
+        return _DEFAULT_TIMEOUT_SECS
+
+
+def _send_reminder(session_id: str, tool_name: str, status: str) -> None:
+    """Push a short reminder ping for a still-pending approval.
+
+    Slack does not push-notify threaded replies, so the original
+    approval Block Kit posted inside a thread can sit unread on mobile
+    indefinitely. We re-ping the gateway notify_cb at the 60s and 300s
+    marks; combined with the `<@user>` mention prefix this turns into a
+    fresh push notification on mobile.
+
+    The reminder reuses the same notify_cb the original prompt used —
+    no special "reminder" channel. If the adapter posts the reminder as
+    yet another threaded reply, the mention prefix forces the push
+    notification regardless.
+    """
+    msg = (
+        f"{_mention_prefix()}⏰ MCP approval reminder — `{tool_name}` "
+        f"{status}. Reply `/approve`, `/allow-session`, `/allow-always`, "
+        f"or `/deny`."
+    )
+    try:
+        from tools.approval import _gateway_notify_cbs, _lock as _approval_lock  # type: ignore
+        try:
+            from tools.approval import get_current_session_key  # type: ignore
+            session_key = get_current_session_key(default=session_id)
+        except Exception:
+            session_key = session_id
+    except Exception:
+        _gateway_notify_cbs = {}
+        _approval_lock = None
+        session_key = session_id
+
+    notify_cb = None
+    if _approval_lock is not None:
+        with _approval_lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+            if notify_cb is None and session_key != session_id:
+                notify_cb = _gateway_notify_cbs.get(session_id)
+
+    if notify_cb is None:
+        # CLI fallback — print the reminder so it shows up in the
+        # terminal scrollback at least.
+        print(msg)
+        return
+
+    try:
+        notify_cb({
+            "command": f"mcp:{tool_name}:reminder",
+            "description": msg,
+            "pattern_key": f"mcp:{tool_name}",
+            "pattern_keys": [f"mcp:{tool_name}"],
+        })
+    except Exception as exc:
+        logger.warning("Reminder notify failed for %s: %s", tool_name, exc)
+
+
+def _mention_prefix() -> str:
+    """Slack mention prefix used to force a push notification on mobile.
+
+    Slack does not push-notify threaded DM replies by default. Prepending
+    a `<@USERID>` directed mention turns the message into a "you were
+    mentioned" event, which is push-notified on iOS/Android even when
+    the message itself lives inside a thread the user isn't watching.
+
+    The user id is read from `HERMES_APPROVAL_MENTION_USER` (set
+    per-VM by agent-platform). Empty/unset returns "" so behaviour is
+    unchanged on surfaces without a mention mechanism.
+    """
+    mention_user = os.environ.get("HERMES_APPROVAL_MENTION_USER", "").strip()
+    return f"<@{mention_user}> " if mention_user else ""
+
+
 def _send_prompt_to_user(session_id: str, tool_name: str, args: Dict[str, Any]) -> bool:
     """Try to push an approval prompt to whichever surface the user is on.
 
@@ -241,7 +342,7 @@ def _send_prompt_to_user(session_id: str, tool_name: str, args: Dict[str, Any]) 
     """
     mode = _mode_for(tool_name)
     msg = (
-        f"✋ This MCP call needs approval.\n"
+        f"{_mention_prefix()}✋ This MCP call needs approval.\n"
         f"Tool: `{tool_name}` ({mode})\n"
         f"Args: `{_format_args(args)}`\n"
         f"Reply `/approve` to run once, `/approve session` to allow this tool "
@@ -336,7 +437,7 @@ def _queue_and_wait(session_id: str, tool_name: str, args: Dict[str, Any]) -> st
         approval_data = {
             "command": f"mcp:{tool_name}",
             "description": (
-                f"✋ This MCP call needs approval.\n"
+                f"{_mention_prefix()}✋ This MCP call needs approval.\n"
                 f"Tool: `{tool_name}` ({_mode_for(tool_name)})\n"
                 f"Args: `{_format_args(args)}`\n"
                 f"Reply `/approve` to run once, `/approve session` to allow this tool "
@@ -374,14 +475,13 @@ def _queue_and_wait(session_id: str, tool_name: str, args: Dict[str, Any]) -> st
                     _pending.pop(session_id, None)
         return "deny"
 
-    timeout_s = _DEFAULT_TIMEOUT_SECS
-    try:
-        timeout_s = int(os.environ.get("HERMES_MCP_APPROVAL_TIMEOUT", _DEFAULT_TIMEOUT_SECS))
-    except (TypeError, ValueError):
-        pass
+    timeout_s = _resolve_timeout(tool_name)
 
     deadline = time.monotonic() + max(timeout_s, 1)
+    start = time.monotonic()
     resolved = False
+    reminded_60s = False
+    reminded_5m = False
     # Poll in 1s slices so the agent's inactivity heartbeat can still tick.
     try:
         from tools.environments.base import touch_activity_if_due  # type: ignore
@@ -396,6 +496,22 @@ def _queue_and_wait(session_id: str, tool_name: str, args: Dict[str, Any]) -> st
         if entry.event.wait(timeout=min(1.0, remaining)):
             resolved = True
             break
+        elapsed = time.monotonic() - start
+        if not reminded_60s and elapsed >= 60:
+            reminded_60s = True
+            _send_reminder(
+                session_id,
+                tool_name,
+                "still pending (1 minute)",
+            )
+        elif not reminded_5m and elapsed >= 300:
+            reminded_5m = True
+            _send_reminder(
+                session_id,
+                tool_name,
+                f"still pending (5 minutes — auto-deny in "
+                f"{max(0, int(timeout_s - elapsed) // 60)} min)",
+            )
         if touch_activity_if_due is not None:
             try:
                 touch_activity_if_due(_activity_state, "waiting for MCP approval")
@@ -460,7 +576,7 @@ def _on_pre_tool_call(
     if choice == "timeout":
         msg = (
             f"BLOCKED: approval for `{tool_name}` timed out after "
-            f"{_DEFAULT_TIMEOUT_SECS}s. Ask the user to retry."
+            f"{_resolve_timeout(tool_name)}s. Ask the user to retry."
         )
     else:
         msg = f"BLOCKED: user denied `{tool_name}`."
