@@ -545,3 +545,294 @@ class TestHermesIntegration:
             f"after /allow, get_pre_tool_call_block_message should return None "
             f"(no block), got {outcome!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Push-notify fixes — timeout default, per-tool override, mention prefix,
+# progressive reminders (root cause: silent timeout on Slack threaded DM
+# replies that don't push-notify on mobile).
+# ---------------------------------------------------------------------------
+
+class TestTimeoutDefaults:
+    def test_default_timeout_is_20_minutes(self, fresh_plugin):
+        # Bumped from 300s → 1200s so async chat (Slack DM threaded reply,
+        # missed push notification, user comes back from lunch) still has
+        # a live approval prompt instead of a stale BLOCKED.
+        assert fresh_plugin._DEFAULT_TIMEOUT_SECS == 1200
+
+    def test_resolve_timeout_uses_module_default(self, fresh_plugin, monkeypatch):
+        monkeypatch.delenv("HERMES_MCP_APPROVAL_TIMEOUT", raising=False)
+        monkeypatch.delenv(
+            "HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER", raising=False,
+        )
+        assert fresh_plugin._resolve_timeout("voluum_create_offer") == 1200
+
+    def test_resolve_timeout_global_override(self, fresh_plugin, monkeypatch):
+        monkeypatch.setenv("HERMES_MCP_APPROVAL_TIMEOUT", "900")
+        monkeypatch.delenv(
+            "HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER", raising=False,
+        )
+        assert fresh_plugin._resolve_timeout("voluum_create_offer") == 900
+
+    def test_resolve_timeout_per_tool_beats_global(self, fresh_plugin, monkeypatch):
+        # Per-tool override should beat the global, so ops can trim
+        # noisy tools without changing the ceiling.
+        monkeypatch.setenv("HERMES_MCP_APPROVAL_TIMEOUT", "900")
+        monkeypatch.setenv(
+            "HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER", "600",
+        )
+        assert fresh_plugin._resolve_timeout("voluum_create_offer") == 600
+        # Other tools still get the global default.
+        assert fresh_plugin._resolve_timeout("voluum_archive_campaign") == 900
+
+    def test_resolve_timeout_per_tool_name_normalisation(self, fresh_plugin, monkeypatch):
+        # Tool names with `:` or `-` are normalised to `_` so env vars
+        # stay shell-safe.
+        monkeypatch.setenv(
+            "HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER", "60",
+        )
+        assert fresh_plugin._resolve_timeout("voluum-create-offer") == 60
+        assert fresh_plugin._resolve_timeout("voluum:create:offer") == 60
+
+    def test_resolve_timeout_bad_value_falls_back(self, fresh_plugin, monkeypatch):
+        # A bad per-tool override doesn't blow up the call; we fall back
+        # to the global / default.
+        monkeypatch.setenv(
+            "HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER", "not-a-number",
+        )
+        monkeypatch.delenv("HERMES_MCP_APPROVAL_TIMEOUT", raising=False)
+        assert fresh_plugin._resolve_timeout("voluum_create_offer") == 1200
+
+
+class TestMentionPrefix:
+    def test_no_mention_when_env_unset(self, fresh_plugin, monkeypatch):
+        monkeypatch.delenv("HERMES_APPROVAL_MENTION_USER", raising=False)
+        assert fresh_plugin._mention_prefix() == ""
+
+    def test_mention_when_env_set(self, fresh_plugin, monkeypatch):
+        monkeypatch.setenv("HERMES_APPROVAL_MENTION_USER", "U01CVNZK5U7")
+        assert fresh_plugin._mention_prefix() == "<@U01CVNZK5U7> "
+
+    def test_blank_env_treated_as_unset(self, fresh_plugin, monkeypatch):
+        # Whitespace-only value shouldn't render `<@   > `.
+        monkeypatch.setenv("HERMES_APPROVAL_MENTION_USER", "   ")
+        assert fresh_plugin._mention_prefix() == ""
+
+    def test_send_prompt_includes_mention_when_set(
+        self, fresh_plugin, monkeypatch,
+    ):
+        """End-to-end check: the gateway notify_cb description starts with
+        the `<@user>` mention so Slack push-notifies on mobile."""
+        monkeypatch.setenv("HERMES_APPROVAL_MENTION_USER", "U01CVNZK5U7")
+
+        # Capture whatever description the plugin would send to the gateway.
+        captured: list = []
+        from tools.approval import (  # type: ignore
+            _gateway_notify_cbs, _lock as _approval_lock,
+            set_current_session_key, reset_current_session_key,
+        )
+        session_key = "test:mention-prefix"
+
+        def fake_cb(payload):
+            captured.append(payload)
+
+        with _approval_lock:
+            _gateway_notify_cbs[session_key] = fake_cb
+        token = set_current_session_key(session_key)
+        try:
+            sent = fresh_plugin._send_prompt_to_user(
+                session_key, "voluum_create_offer", {"name": "x"},
+            )
+        finally:
+            reset_current_session_key(token)
+            with _approval_lock:
+                _gateway_notify_cbs.pop(session_key, None)
+
+        assert sent is True
+        assert captured, "notify_cb should have been invoked"
+        desc = captured[0]["description"]
+        assert desc.startswith("<@U01CVNZK5U7> "), (
+            f"description should start with mention prefix, got: {desc[:60]!r}"
+        )
+
+    def test_send_prompt_no_mention_when_unset(
+        self, fresh_plugin, monkeypatch,
+    ):
+        monkeypatch.delenv("HERMES_APPROVAL_MENTION_USER", raising=False)
+
+        captured: list = []
+        from tools.approval import (  # type: ignore
+            _gateway_notify_cbs, _lock as _approval_lock,
+            set_current_session_key, reset_current_session_key,
+        )
+        session_key = "test:no-mention"
+
+        def fake_cb(payload):
+            captured.append(payload)
+
+        with _approval_lock:
+            _gateway_notify_cbs[session_key] = fake_cb
+        token = set_current_session_key(session_key)
+        try:
+            fresh_plugin._send_prompt_to_user(
+                session_key, "voluum_create_offer", {"name": "x"},
+            )
+        finally:
+            reset_current_session_key(token)
+            with _approval_lock:
+                _gateway_notify_cbs.pop(session_key, None)
+
+        desc = captured[0]["description"]
+        assert not desc.startswith("<@"), (
+            f"description should NOT start with mention when env unset, got: {desc[:60]!r}"
+        )
+        assert desc.startswith("✋"), (
+            f"description should start with the standard prompt, got: {desc[:60]!r}"
+        )
+
+
+class TestProgressiveReminders:
+    def test_send_reminder_invokes_notify_cb(self, fresh_plugin, monkeypatch):
+        """Reminder helper hits the same gateway notify_cb the original
+        prompt used, so Slack pushes a fresh notification on mobile."""
+        monkeypatch.setenv("HERMES_APPROVAL_MENTION_USER", "U01CVNZK5U7")
+        captured: list = []
+        from tools.approval import (  # type: ignore
+            _gateway_notify_cbs, _lock as _approval_lock,
+            set_current_session_key, reset_current_session_key,
+        )
+        session_key = "test:reminder"
+
+        def fake_cb(payload):
+            captured.append(payload)
+
+        with _approval_lock:
+            _gateway_notify_cbs[session_key] = fake_cb
+        token = set_current_session_key(session_key)
+        try:
+            fresh_plugin._send_reminder(
+                session_key, "voluum_create_offer", "still pending (1 minute)",
+            )
+        finally:
+            reset_current_session_key(token)
+            with _approval_lock:
+                _gateway_notify_cbs.pop(session_key, None)
+
+        assert len(captured) == 1
+        payload = captured[0]
+        desc = payload["description"]
+        assert desc.startswith("<@U01CVNZK5U7> "), desc
+        assert "voluum_create_offer" in desc
+        assert "still pending (1 minute)" in desc
+        # Reminder uses a distinct command so the gateway adapter can
+        # render it differently (e.g. simpler text post, no buttons).
+        assert payload["command"].endswith(":reminder")
+
+    def test_send_reminder_silently_skips_when_no_notify_cb(self, fresh_plugin, capsys):
+        # No registered notify_cb → falls through to print() so CLI
+        # users still see something, and importantly doesn't raise.
+        fresh_plugin._send_reminder(
+            "no-such-session", "voluum_create_offer", "still pending (1 minute)",
+        )
+        # Smoke: function returned without exception.
+
+    def test_reminders_fire_at_60s_and_300s_marks(self, fresh_plugin, monkeypatch):
+        """Drive the poll loop with a monkeypatched clock and verify that
+        `_send_reminder` fires once at the 60s mark and once at the 300s
+        mark while the approval is pending. This is the load-bearing
+        check for the Kasper case — the plugin sent the original prompt
+        as a silent threaded reply, then sat for 304s without re-pinging."""
+        # Patch _send_reminder to record calls.
+        calls: list = []
+        monkeypatch.setattr(
+            fresh_plugin, "_send_reminder",
+            lambda sid, tool, status: calls.append((tool, status)),
+        )
+        # Patch the prompt-sending so we don't try to hit a real gateway.
+        monkeypatch.setattr(
+            fresh_plugin, "_send_prompt_to_user",
+            lambda sid, tool, args: True,
+        )
+
+        # Bound the test under 10s by trimming the overall timeout, then
+        # driving the monotonic clock forward in jumps via a fake clock.
+        # We don't actually want to wait 5 minutes per test.
+        fake_time = [0.0]
+
+        real_monotonic = fresh_plugin.time.monotonic
+
+        def fake_monotonic():
+            return fake_time[0]
+
+        # The plugin computes the deadline using time.monotonic() before
+        # entering the wait loop. Patch monotonic globally inside the
+        # plugin's time module.
+        monkeypatch.setattr(fresh_plugin.time, "monotonic", fake_monotonic)
+
+        # Make entry.event.wait() advance the fake clock instead of
+        # actually sleeping, so we can step through the loop without
+        # spending real time.
+        # We need to drive _queue_and_wait directly. Set a long timeout
+        # so the loop runs through both reminder marks.
+        monkeypatch.setenv("HERMES_MCP_APPROVAL_TIMEOUT", "400")
+
+        # Run the wait in a thread, set the event after both reminders
+        # have fired so the loop exits cleanly.
+        done_event = threading.Event()
+
+        # Patch threading.Event.wait via the entry. We need to advance
+        # the clock each time the loop polls. To do this, capture the
+        # entry the plugin creates by monkeypatching _ApprovalEntry.
+        original_resolve = fresh_plugin._queue_and_wait
+
+        class _TestEntry:
+            def __init__(self):
+                self.event = threading.Event()
+                self._waits = 0
+                self.result = None
+
+        captured_entry: list = []
+
+        # Tap _ApprovalEntry to capture the entry the plugin creates.
+        from tools import approval as _approval_mod  # type: ignore
+        original_entry_cls = _approval_mod._ApprovalEntry
+        original_wait = None
+
+        def patched_entry(data):
+            e = original_entry_cls(data)
+            captured_entry.append(e)
+            # Wrap event.wait to advance the fake clock and trip done
+            # once both reminders have fired.
+            real_wait = e.event.wait
+
+            def wait(timeout=None):
+                fake_time[0] += 1.0  # Advance one polling slice
+                # End the call after we cross 300s reminder + a tick.
+                if len(calls) >= 2 and fake_time[0] >= 305:
+                    e.event.set()
+                    return True
+                return False
+
+            e.event.wait = wait  # type: ignore[assignment]
+            return e
+
+        monkeypatch.setattr(_approval_mod, "_ApprovalEntry", patched_entry)
+
+        try:
+            choice = fresh_plugin._queue_and_wait(
+                "test-sess", "voluum_create_offer", {"x": 1},
+            )
+        finally:
+            # Restore monotonic so other tests aren't affected.
+            monkeypatch.setattr(fresh_plugin.time, "monotonic", real_monotonic)
+
+        # We expect exactly two reminder calls (60s then 300s).
+        statuses = [s for (_t, s) in calls]
+        assert any("1 minute" in s for s in statuses), (
+            f"missing 60s reminder, got statuses: {statuses}"
+        )
+        assert any("5 minutes" in s for s in statuses), (
+            f"missing 300s reminder, got statuses: {statuses}"
+        )
+        # Both reminders target the right tool.
+        assert all(t == "voluum_create_offer" for (t, _s) in calls)
