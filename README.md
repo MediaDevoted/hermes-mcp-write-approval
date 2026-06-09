@@ -109,9 +109,27 @@ Set neither env var, and the plugin falls back to checking tool name suffixes. A
 | `HERMES_MCP_APPROVAL_MANIFESTS` | — | Comma-separated list of `/tools-manifest` URLs |
 | `HERMES_MCP_APPROVAL_CATALOG` | — | Single URL returning a flat tool list |
 | `HERMES_MCP_APPROVAL_AUTH` | — | Bearer token for authenticated manifest endpoints |
-| `HERMES_MCP_APPROVAL_TIMEOUT` | `300` | Seconds before an unanswered prompt is auto-denied |
+| `HERMES_MCP_APPROVAL_TIMEOUT` | `1200` | Seconds before an unanswered prompt is auto-denied (20min, was 5min) |
+| `HERMES_MCP_APPROVAL_TIMEOUT_<TOOL>` | — | Per-tool timeout override. `<TOOL>` is the tool name upcased with `:`/`-` → `_`. e.g. `HERMES_MCP_APPROVAL_TIMEOUT_VOLUUM_CREATE_OFFER=600` |
+| `HERMES_APPROVAL_MENTION_USER` | — | Slack user id (e.g. `U01CVNZK5U7`) to `<@>`-mention at the start of every approval prompt and reminder. Forces a push notification on mobile even when the message is a threaded DM reply |
 
 See `.env.template` for a copy-paste starting point.
+
+### Push notification reliability (Slack)
+
+Slack does **not** push-notify threaded DM replies by default. The original
+approval Block Kit posted by the gateway lives inside a thread the user
+isn't actively watching, so on mobile it stays silent. To make sure the
+user actually sees the prompt:
+
+1. **Set `HERMES_APPROVAL_MENTION_USER`** to their Slack user id. The
+   plugin prepends `<@USERID>` to every approval message and reminder,
+   which turns the message into a directed-mention event that Slack
+   pushes regardless of thread state.
+2. **Progressive reminders.** The plugin re-pings the gateway at the
+   60-second and 5-minute marks while an approval is still pending, so
+   even if the first push is missed there are two more chances before
+   the 20-minute timeout fires.
 
 ## How it works
 
@@ -141,7 +159,7 @@ python -m pytest tests/test_plugin.py -v
 
 ## Tests
 
-19 tests covering:
+Tests cover:
 
 - Mode classification (catalog override, suffix heuristic, built-in tool pass-through)
 - Approval state isolation (session vs. persistent)
@@ -149,6 +167,9 @@ python -m pytest tests/test_plugin.py -v
 - `pre_tool_call` block/unblock for all four resolutions (`once`, `session`, `always`, `deny`)
 - FIFO ordering for queued calls
 - End-to-end path through Hermes' real `invoke_hook` + slash handler dispatch (no mocking)
+- Timeout defaults + per-tool override env (`HERMES_MCP_APPROVAL_TIMEOUT_<TOOL>`)
+- Slack mention prefix appears in prompts and reminders when `HERMES_APPROVAL_MENTION_USER` is set, absent otherwise
+- Progressive reminders fire at the 60s and 300s elapsed marks while pending
 
 ## Deployment
 
