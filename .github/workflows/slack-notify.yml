@@ -1,0 +1,89 @@
+# MediaDevoted — Slack notify
+# Posts repository activity (pushes, PRs, issues, comments, reviews,
+# releases, stars, forks, tags) to the channel behind the
+# SLACK_WEBHOOK_URL secret (an org-level secret covers every repo).
+name: slack-notify
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+  issues:
+  issue_comment:
+  pull_request_review:
+  release:
+  create:
+  delete:
+  fork:
+  star:
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          EVENT_JSON: ${{ github.event_path }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_WEBHOOK_URL not set (org secret missing) - skipping"
+            exit 0
+          fi
+
+          TEXT=$(jq -r --arg ev "$EVENT_NAME" --arg repo "$REPO" --arg actor "$ACTOR" --arg server "$SERVER_URL" '
+            def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+            def repolink: "<\($server)/\($repo)|\($repo)>";
+            def userlink: "<\(.sender.html_url // ($server + "/" + $actor))|\($actor)>";
+            def firstline($s): ($s // "" | split("\n"))[0] | esc;
+
+            if $ev == "push" then
+              if .deleted then
+                "\(.ref | esc) was deleted by \($actor) in \(repolink)"
+              else
+                (.commits | length) as $n |
+                ((.ref // "") | sub("^refs/heads/"; "") | esc) as $br |
+                "⬆️ \(userlink) pushed \($n) commit\(if $n == 1 then "" else "s" end) to `\($br)` in \(repolink)\n" +
+                ([.commits[] | "• <\(.url)|\(.id[0:7])> \(firstline(.message))"] | .[0:5] | join("\n"))
+              end
+            elif $ev == "pull_request" then
+              (.action) as $a |
+              (.pull_request.merged) as $m |
+              "🔀 \(userlink) \($a) PR <\(.pull_request.html_url)|#\(.pull_request.number) \(.pull_request.title | esc)> in \(repolink)\(if $a == "closed" and $m then " (merged ✅)" elif $a == "closed" then " ❌" else "" end)"
+            elif $ev == "issues" then
+              "📝 \(userlink) \(.action) issue <\(.issue.html_url)|#\(.issue.number) \(.issue.title | esc)> in \(repolink)"
+            elif $ev == "issue_comment" then
+              "💬 \(userlink) commented on <\(.comment.html_url // .issue.html_url)|#\(.issue.number) \(.issue.title | esc)> in \(repolink)\n> \(firstline(.comment.body))"
+            elif $ev == "pull_request_review" then
+              "👀 \(userlink) \(.action // "reviewed") review (\(.review.state // "?")) on PR <\(.pull_request.html_url)|#\(.pull_request.number) \(.pull_request.title | esc)> in \(repolink)"
+            elif $ev == "release" then
+              "📦 \(userlink) \(.action) release <\(.release.html_url)|\(.release.name // .release.tag_name | esc)> in \(repolink)"
+            elif $ev == "create" then
+              (if .ref_type == "tag" then "🌱 \(userlink) created tag `\(.ref | esc)` in \(repolink)" else "" end)
+            elif $ev == "delete" then
+              (if .ref_type == "tag" then "🗑️ \(userlink) deleted tag `\(.ref | esc)` in \(repolink)" else "" end)
+            elif $ev == "fork" then
+              "🍴 \(userlink) forked \(repolink) → <\(.forkee.html_url)|\(.forkee.full_name | esc)>"
+            elif $ev == "star" then
+              (if .action == "created" then "⭐ \(userlink) starred \(repolink)" else "" end)
+            elif $ev == "workflow_dispatch" then
+              "▶️ Slack notify test run by \($actor) in \(repolink) - if you can read this, it works! 🎉"
+            else
+              "⚙️ \(userlink) triggered `\($ev)`\(if .action then " (\(.action))" else "" end) in \(repolink)"
+            end
+          ' "$EVENT_JSON")
+
+          if [ -z "$TEXT" ]; then
+            echo "filtered event - nothing to send"
+            exit 0
+          fi
+
+          jq -n --arg text "$TEXT" \
+            '{text: $text, username: "MediaDevoted GitHub", icon_emoji: ":github:"}' |
+          curl -sf -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"
